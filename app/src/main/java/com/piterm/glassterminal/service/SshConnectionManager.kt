@@ -2,11 +2,22 @@ package com.piterm.glassterminal.service
 
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.util.Log
+import androidx.core.content.edit
 import com.piterm.glassterminal.model.ConnectionState
 import com.piterm.glassterminal.model.PiDevice
-import kotlinx.coroutines.*
+import com.piterm.glassterminal.model.VncServerState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,37 +36,46 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Manages the SSH connection to the Raspberry Pi, including:
- * - Ed25519 key-based authentication (no passwords)
- * - Local port forwarding for VNC (5901) and Websockify (6080)
+ * - Ed25519 key-based authentication
+ * - Local port forwarding for VNC (5901) and websockify (6080)
  * - Interactive shell session for the terminal
  * - Host key fingerprint verification on first connect
- *
- * All operations run on Dispatchers.IO to never block the UI thread.
  */
+@Suppress("SpellCheckingInspection")
 class SshConnectionManager(private val context: Context) {
+
+    init {
+        // Register EdDSA provider for SSHJ to support Ed25519 keys
+        java.security.Security.addProvider(net.i2p.crypto.eddsa.EdDSASecurityProvider())
+    }
 
     companion object {
         private const val TAG = "SshConnMgr"
-        private const val SSH_PORT = 22
         private const val CONNECT_TIMEOUT_MS = 10_000
-        private const val KEEPALIVE_INTERVAL_SEC = 15
+        private const val COMMAND_TIMEOUT_MS = 5_000L
+        private const val VNC_START_TIMEOUT_MS = 15_000L
+        private const val VNC_STOP_TIMEOUT_MS = 10_000L
 
-        // Remote ports on the Pi (bound to localhost)
         private const val PI_VNC_PORT = 5901
         private const val PI_WEBSOCKIFY_PORT = 6080
 
-        // Local forwarded ports on Android (connect noVNC/VNC here)
         const val LOCAL_VNC_PORT = 15901
         const val LOCAL_WEBSOCKIFY_PORT = 16080
 
+        private const val KEY_VNC_PASSWORD = "vnc_password"
+
         private const val PREFS_NAME = "glassterminal_ssh"
         private const val KEY_HOST_FINGERPRINT = "host_fingerprint_"
+        private const val KEY_SSH_USERNAME = "ssh_username"
     }
 
     private val keyManager = KeyManager(context)
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+
+    private val _vncServerState = MutableStateFlow<VncServerState>(VncServerState.Stopped)
+    val vncServerState: StateFlow<VncServerState> = _vncServerState.asStateFlow()
 
     private var sshClient: SSHClient? = null
     private var shellSession: Session? = null
@@ -67,57 +87,69 @@ class SshConnectionManager(private val context: Context) {
     private var vncServerSocket: ServerSocket? = null
     private var websockifyServerSocket: ServerSocket? = null
 
-    // ── Public API ──────────────────────────────────────────────────────────
+    private data class RemoteCommandResult(
+        val stdout: String = "",
+        val stderr: String = "",
+        val exitStatus: Int? = null,
+        val timedOut: Boolean = false,
+        val transportError: String? = null,
+    ) {
+        val combinedOutput: String
+            get() = listOf(stdout, stderr, transportError)
+                .map { it?.trim().orEmpty() }
+                .filter { it.isNotEmpty() }
+                .joinToString("\n")
+
+        val succeeded: Boolean
+            get() = !timedOut && transportError == null && (exitStatus == null || exitStatus == 0)
+    }
 
     /**
      * Establishes the full connection pipeline:
      * 1. SSH connect + Ed25519 auth
-     * 2. Start local port forward for VNC (5901 → 15901)
-     * 3. Start local port forward for Websockify (6080 → 16080)
-     * 4. Start keepalive
-     * 5. Start foreground service
+     * 2. Start local port forward for VNC (5901 -> 15901)
+     * 3. Start local port forward for websockify (6080 -> 16080)
+     * 4. Publish the connected state
+     * 5. Start the foreground service
      */
     suspend fun connect(device: PiDevice) = withContext(Dispatchers.IO) {
         try {
-            _connectionState.value = ConnectionState.Connecting(device, "Establishing SSH…")
+            _connectionState.value = ConnectionState.Connecting(device, "Establishing SSH...")
 
-            // Ensure we have keys
             if (!keyManager.hasKeyPair()) {
-                _connectionState.value = ConnectionState.Connecting(device, "Generating SSH keys…")
+                _connectionState.value = ConnectionState.Connecting(device, "Generating SSH keys...")
                 keyManager.generateKeyPair()
             }
 
-            // Create SSH client
             val client = SSHClient()
-            // ── Host Key Verification ──
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val fingerprintKey = KEY_HOST_FINGERPRINT + device.ipAddress
             val savedFingerprint = prefs.getString(fingerprintKey, null)
 
             if (savedFingerprint == null) {
-                // First connection — TOFU: accept and save
                 client.addHostKeyVerifier(object : HostKeyVerifier {
                     override fun verify(hostname: String?, port: Int, key: PublicKey?): Boolean {
                         val fingerprint = net.schmizz.sshj.common.SecurityUtils.getFingerprint(key)
-                        prefs.edit().putString(fingerprintKey, fingerprint).apply()
-                        Log.i(TAG, "TOFU: saved host fingerprint $fingerprint for ${device.ipAddress}")
+                        prefs.edit { putString(fingerprintKey, fingerprint) }
+                        Log.i(TAG, "TOFU saved host fingerprint $fingerprint for ${device.ipAddress}")
                         return true
                     }
+
                     override fun findExistingAlgorithms(hostname: String?, port: Int): List<String> {
                         return emptyList()
                     }
                 })
             } else {
-                // Subsequent connections — verify against saved fingerprint
                 client.addHostKeyVerifier(object : HostKeyVerifier {
                     override fun verify(hostname: String?, port: Int, key: PublicKey?): Boolean {
                         val fingerprint = net.schmizz.sshj.common.SecurityUtils.getFingerprint(key)
                         val match = fingerprint == savedFingerprint
                         if (!match) {
-                            Log.e(TAG, "HOST KEY MISMATCH! Expected $savedFingerprint, got $fingerprint")
+                            Log.e(TAG, "Host key mismatch. Expected $savedFingerprint, got $fingerprint")
                         }
                         return match
                     }
+
                     override fun findExistingAlgorithms(hostname: String?, port: Int): List<String> {
                         return emptyList()
                     }
@@ -127,93 +159,94 @@ class SshConnectionManager(private val context: Context) {
             client.connectTimeout = CONNECT_TIMEOUT_MS
             client.timeout = CONNECT_TIMEOUT_MS
 
-            _connectionState.value = ConnectionState.Connecting(device, "Connecting to ${device.ipAddress}…")
+            _connectionState.value = ConnectionState.Connecting(
+                device,
+                "Connecting to ${device.ipAddress}..."
+            )
             client.connect(device.ipAddress, device.port)
 
-            // Authenticate with Ed25519 key
-            _connectionState.value = ConnectionState.Connecting(device, "Authenticating with Ed25519 key…")
+            _connectionState.value = ConnectionState.Connecting(
+                device,
+                "Authenticating with Ed25519 key..."
+            )
             val keyPair = keyManager.loadKeyPair()
             val keyProvider = Ed25519KeyProvider(keyPair)
-            client.authPublickey(getUsernameForDevice(device), keyProvider)
+            client.authPublickey(getUsernameForDevice(), keyProvider)
 
             sshClient = client
             Log.i(TAG, "SSH authenticated to ${device.ipAddress}")
 
-            // Start port forwards
-            _connectionState.value = ConnectionState.Connecting(device, "Setting up secure tunnels…")
+            _connectionState.value = ConnectionState.Connecting(device, "Setting up secure tunnels...")
             val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
             connectionScope = scope
 
-            // Forward VNC
             vncForwarderJob = scope.launch {
                 startPortForward(
-                    client, LOCAL_VNC_PORT, "127.0.0.1", PI_VNC_PORT,
-                    isVnc = true
+                    client = client,
+                    localPort = LOCAL_VNC_PORT,
+                    remoteHost = "127.0.0.1",
+                    remotePort = PI_VNC_PORT,
+                    isVnc = true,
                 )
             }
 
-            // Forward Websockify
             websockifyForwarderJob = scope.launch {
                 startPortForward(
-                    client, LOCAL_WEBSOCKIFY_PORT, "127.0.0.1", PI_WEBSOCKIFY_PORT,
-                    isVnc = false
+                    client = client,
+                    localPort = LOCAL_WEBSOCKIFY_PORT,
+                    remoteHost = "127.0.0.1",
+                    remotePort = PI_WEBSOCKIFY_PORT,
+                    isVnc = false,
                 )
             }
 
-            // Keepalive: Use SSHJ's built-in heartbeat if supported by this version
-            // In some 0.3x versions it's transport.setHeartbeatInterval(int)
-            // client.transport.heartbeatInterval = KEEPALIVE_INTERVAL_SEC
-
-            // Brief delay for tunnels to bind
             delay(500)
 
             _connectionState.value = ConnectionState.Connected(
                 device = device,
                 sshReady = true,
                 vncTunnelReady = true,
-                websockifyTunnelReady = true
+                websockifyTunnelReady = true,
             )
-            Log.i(TAG, "Fully connected: SSH + VNC tunnel + Websockify tunnel")
 
-            // Start foreground service to keep tunnel alive in background
+            scope.launch { checkVncStatus() }
+            Log.i(TAG, "Fully connected: SSH, VNC tunnel, and websockify tunnel")
+
             startForegroundService()
-
         } catch (e: Exception) {
             Log.e(TAG, "Connection failed", e)
             val msg = when {
                 e.message?.contains("Auth fail") == true ->
                     "Authentication failed. Is your public key in the Pi's authorized_keys?"
                 e.message?.contains("HOST KEY MISMATCH") == true ->
-                    "Host key verification failed! The Pi's identity has changed. " +
-                    "If you reinstalled the Pi OS, clear the saved fingerprint in Settings."
+                    "Host key verification failed. Clear the saved fingerprint if the Pi was reinstalled."
                 e.message?.contains("connect") == true ->
                     "Cannot reach ${device.ipAddress}. Is the Pi powered on and connected to your hotspot?"
                 else -> "Connection error: ${e.message}"
             }
             _connectionState.value = ConnectionState.Error(msg, device)
-            // Clean up resources without overwriting the error state
             cleanupResources()
         }
     }
 
     /**
      * Opens an interactive SSH shell session.
-     * Returns the shell's input and output streams for the terminal emulator.
      */
-    suspend fun openShell(): Triple<InputStream, OutputStream, Session.Shell>? = withContext(Dispatchers.IO) {
-        val client = sshClient ?: return@withContext null
-        try {
-            val session = client.startSession()
-            session.allocateDefaultPTY()
-            val sh = session.startShell()
-            shellSession = session
-            shell = sh
-            Triple(sh.inputStream, sh.outputStream, sh)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to open shell", e)
-            null
+    suspend fun openShell(): Triple<InputStream, OutputStream, Session.Shell>? =
+        withContext(Dispatchers.IO) {
+            val client = sshClient ?: return@withContext null
+            try {
+                val session = client.startSession()
+                session.allocateDefaultPTY()
+                val sh = session.startShell()
+                shellSession = session
+                shell = sh
+                Triple(sh.inputStream, sh.outputStream, sh)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to open shell", e)
+                null
+            }
         }
-    }
 
     /**
      * Resizes the PTY for the current shell session.
@@ -226,46 +259,11 @@ class SshConnectionManager(private val context: Context) {
         }
     }
 
-    /**
-     * Executes a single command and returns the output.
-     */
-    suspend fun exec(command: String): String = withContext(Dispatchers.IO) {
-        val client = sshClient ?: return@withContext "Error: Not connected"
-        try {
-            val session = client.startSession()
-            val cmd = session.exec(command)
-            val output = cmd.inputStream.bufferedReader().readText()
-            cmd.join(5, TimeUnit.SECONDS)
-            session.close()
-            output
-        } catch (e: Exception) {
-            "Error: ${e.message}"
-        }
-    }
-
-    /**
-     * Returns the public key string for display/copying.
-     */
     fun getPublicKey(): String = keyManager.getPublicKeyString()
 
-    /**
-     * Whether keys exist.
-     */
     fun hasKeys(): Boolean = keyManager.hasKeyPair()
 
-    /**
-     * Generate keys and return the public key.
-     */
     fun generateKeys(): String = keyManager.generateKeyPair()
-
-    /**
-     * Clears the saved host fingerprint for a given IP.
-     */
-    fun clearHostFingerprint(ip: String) {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().remove(KEY_HOST_FINGERPRINT + ip).apply()
-        Log.i(TAG, "Cleared host fingerprint for $ip")
-    }
 
     /**
      * Disconnects everything gracefully and updates state.
@@ -273,20 +271,227 @@ class SshConnectionManager(private val context: Context) {
     fun disconnect() {
         cleanupResources()
         _connectionState.value = ConnectionState.Disconnected
+        _vncServerState.value = VncServerState.Stopped
         stopForegroundService()
         Log.i(TAG, "Disconnected.")
     }
 
     /**
-     * Whether the SSH client is currently connected.
+     * Spawns a virtual VNC desktop on the Pi and ensures websockify is running.
      */
-    fun isConnected(): Boolean = sshClient?.isConnected == true
+    suspend fun startVncServer(): Boolean = withContext(Dispatchers.IO) {
+        _vncServerState.value = VncServerState.Starting
+        try {
+            val passwordConfigured = execResult("test -f ~/.vnc/passwd")
+            if (!passwordConfigured.succeeded) {
+                _vncServerState.value = VncServerState.Error(
+                    "VNC password not configured. Run `vncserver :1` once over SSH first."
+                )
+                return@withContext false
+            }
 
-    // ── Internal ────────────────────────────────────────────────────────────
+            val websockifyInstalled = execResult("command -v websockify >/dev/null 2>&1")
+            if (!websockifyInstalled.succeeded) {
+                _vncServerState.value = VncServerState.Error("websockify is not installed on the Pi.")
+                return@withContext false
+            }
+
+            val vncResult = execResult("vncserver :1", timeoutMs = VNC_START_TIMEOUT_MS)
+            Log.i(TAG, "vncserver output: ${vncResult.combinedOutput}")
+
+            val vncAlreadyRunning =
+                vncResult.combinedOutput.contains("already running", ignoreCase = true)
+
+            if (vncResult.timedOut) {
+                _vncServerState.value = VncServerState.Error(
+                    "vncserver timed out. Make sure the VNC password is already configured on the Pi."
+                )
+                return@withContext false
+            }
+
+            if (!vncResult.succeeded && !vncAlreadyRunning) {
+                val message = vncResult.combinedOutput.ifBlank { "Unknown VNC error" }
+                _vncServerState.value = VncServerState.Error("VNC failed: $message")
+                return@withContext false
+            }
+
+            val websockifyStart = if (isWebsockifyRunning()) {
+                RemoteCommandResult(exitStatus = 0)
+            } else {
+                execResult("websockify --daemon 6080 localhost:5901")
+            }
+            Log.i(TAG, "websockify output: ${websockifyStart.combinedOutput}")
+
+            val initialWebsockifyRunning = isWebsockifyRunning()
+            if (!websockifyStart.succeeded && !initialWebsockifyRunning) {
+                val message = websockifyStart.combinedOutput.ifBlank { "Unknown websockify error" }
+                _vncServerState.value = VncServerState.Error("websockify failed: $message")
+                return@withContext false
+            }
+
+            delay(750)
+            val vncRunning = isVncRunning()
+            val websockifyRunning = isWebsockifyRunning()
+            if (vncRunning && websockifyRunning) {
+                _vncServerState.value = VncServerState.Running
+                Log.i(TAG, "Desktop spawned: VNC and websockify active")
+                true
+            } else {
+                val message = when {
+                    !vncRunning -> "VNC process not found after start"
+                    else -> "websockify did not stay running after start"
+                }
+                _vncServerState.value = VncServerState.Error(message)
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start VNC server", e)
+            _vncServerState.value = VncServerState.Error("Start failed: ${e.message}")
+            false
+        }
+    }
 
     /**
-     * Cleans up SSH resources WITHOUT changing the connection state.
-     * This prevents the error state from being overwritten.
+     * Stops the virtual VNC desktop and any matching websockify bridge.
+     */
+    suspend fun stopVncServer(): Boolean = withContext(Dispatchers.IO) {
+        _vncServerState.value = VncServerState.Stopping
+        try {
+            val result = execResult(
+                "vncserver -kill :1 >/dev/null 2>&1 || true; " +
+                    "pkill -f 'websockify.*6080.*5901' >/dev/null 2>&1 || true",
+                timeoutMs = VNC_STOP_TIMEOUT_MS,
+            )
+            Log.i(TAG, "Kill desktop output: ${result.combinedOutput}")
+
+            delay(250)
+            val vncStillRunning = isVncRunning()
+            val websockifyStillRunning = isWebsockifyRunning()
+
+            if (!vncStillRunning && !websockifyStillRunning) {
+                _vncServerState.value = VncServerState.Stopped
+                Log.i(TAG, "Desktop stopped and RAM reclaimed")
+                true
+            } else {
+                val message = buildString {
+                    if (vncStillRunning) append("VNC server is still running. ")
+                    if (websockifyStillRunning) append("websockify is still running.")
+                }.trim()
+                _vncServerState.value = VncServerState.Error(message)
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop VNC server", e)
+            _vncServerState.value = VncServerState.Error("Kill failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Checks whether the VNC server is running and ensures websockify is available.
+     */
+    suspend fun checkVncStatus() = withContext(Dispatchers.IO) {
+        try {
+            val vncRunning = isVncRunning()
+            if (!vncRunning) {
+                _vncServerState.value = VncServerState.Stopped
+                Log.i(TAG, "No VNC server running")
+                return@withContext
+            }
+
+            if (!isWebsockifyRunning()) {
+                execResult("websockify --daemon 6080 localhost:5901")
+            }
+
+            if (isWebsockifyRunning()) {
+                _vncServerState.value = VncServerState.Running
+                Log.i(TAG, "VNC server and websockify are running")
+            } else {
+                _vncServerState.value = VncServerState.Error(
+                    "Desktop is running, but websockify is unavailable."
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not check VNC status: ${e.message}")
+        }
+    }
+
+    fun saveVncPassword(password: String) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit { putString(KEY_VNC_PASSWORD, password) }
+    }
+
+    fun getVncPassword(): String {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getString(KEY_VNC_PASSWORD, "") ?: ""
+    }
+
+    fun saveUsername(username: String) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit { putString(KEY_SSH_USERNAME, username) }
+    }
+
+    fun getUsername(): String {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getString(KEY_SSH_USERNAME, "pi") ?: "pi"
+    }
+
+    private suspend fun execResult(
+        command: String,
+        timeoutMs: Long = COMMAND_TIMEOUT_MS,
+    ): RemoteCommandResult = withContext(Dispatchers.IO) {
+        val client = sshClient ?: return@withContext RemoteCommandResult(transportError = "Not connected")
+
+        var session: Session? = null
+        try {
+            session = client.startSession()
+            val cmd = session.exec(command)
+
+            val stdoutDeferred = async(Dispatchers.IO) {
+                cmd.inputStream.bufferedReader().use { it.readText() }
+            }
+            val stderrDeferred = async(Dispatchers.IO) {
+                cmd.errorStream.bufferedReader().use { it.readText() }
+            }
+
+            cmd.join(timeoutMs, TimeUnit.MILLISECONDS)
+            val timedOut = cmd.isOpen
+            runCatching { cmd.close() }
+
+            val stdout = withTimeoutOrNull(1_000) { stdoutDeferred.await() }.orEmpty()
+            val stderr = withTimeoutOrNull(1_000) { stderrDeferred.await() }.orEmpty()
+
+            if (!stdoutDeferred.isCompleted) stdoutDeferred.cancel()
+            if (!stderrDeferred.isCompleted) stderrDeferred.cancel()
+
+            RemoteCommandResult(
+                stdout = stdout.trimEnd(),
+                stderr = stderr.trimEnd(),
+                exitStatus = if (timedOut) null else cmd.exitStatus,
+                timedOut = timedOut,
+            )
+        } catch (e: Exception) {
+            RemoteCommandResult(transportError = e.message ?: "Unknown SSH error")
+        } finally {
+            try {
+                session?.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private suspend fun isVncRunning(): Boolean {
+        val result = execResult("pgrep -f 'Xtightvnc.*:1'")
+        return result.succeeded
+    }
+
+    private suspend fun isWebsockifyRunning(): Boolean {
+        val result = execResult("pgrep -f 'websockify.*6080.*5901'")
+        return result.succeeded
+    }
+
+    /**
+     * Cleans up SSH resources without changing the connection state.
      */
     private fun cleanupResources() {
         keepAliveJob?.cancel()
@@ -294,11 +499,26 @@ class SshConnectionManager(private val context: Context) {
         websockifyForwarderJob?.cancel()
         connectionScope?.cancel()
 
-        try { vncServerSocket?.close() } catch (_: Exception) {}
-        try { websockifyServerSocket?.close() } catch (_: Exception) {}
-        try { shell?.close() } catch (_: Exception) {}
-        try { shellSession?.close() } catch (_: Exception) {}
-        try { sshClient?.disconnect() } catch (_: Exception) {}
+        try {
+            vncServerSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            websockifyServerSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            shell?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            shellSession?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            sshClient?.disconnect()
+        } catch (_: Exception) {
+        }
 
         shell = null
         shellSession = null
@@ -308,17 +528,14 @@ class SshConnectionManager(private val context: Context) {
     }
 
     /**
-     * Correct SSHJ local port forwarding implementation.
-     * Creates a ServerSocket, accepts incoming connections, and for each
-     * connection opens an SSH direct-tcpip channel to the remote host:port,
-     * then bidirectionally copies data between the local socket and the SSH channel.
+     * Local port forwarding via SSH direct-tcpip channels.
      */
     private suspend fun startPortForward(
         client: SSHClient,
         localPort: Int,
         remoteHost: String,
         remotePort: Int,
-        isVnc: Boolean
+        isVnc: Boolean,
     ) = withContext(Dispatchers.IO) {
         var serverSocket: ServerSocket? = null
         try {
@@ -326,27 +543,25 @@ class SshConnectionManager(private val context: Context) {
             serverSocket.reuseAddress = true
             serverSocket.bind(InetSocketAddress("127.0.0.1", localPort))
 
-            // Store ref so we can close it on disconnect
-            if (isVnc) vncServerSocket = serverSocket
-            else websockifyServerSocket = serverSocket
+            if (isVnc) {
+                vncServerSocket = serverSocket
+            } else {
+                websockifyServerSocket = serverSocket
+            }
 
-            Log.i(TAG, "Port forward listening: localhost:$localPort → $remoteHost:$remotePort")
+            Log.i(TAG, "Port forward listening: localhost:$localPort -> $remoteHost:$remotePort")
 
             while (isActive) {
                 val localSocket = serverSocket.accept()
                 launch {
                     try {
-                        val channel = client.newDirectConnection(
-                            remoteHost, remotePort
-                        )
+                        val channel = client.newDirectConnection(remoteHost, remotePort)
 
-                        // Bidirectional copy between local socket and SSH channel
                         val localIn = localSocket.getInputStream()
                         val localOut = localSocket.getOutputStream()
                         val remoteIn = channel.inputStream
                         val remoteOut = channel.outputStream
 
-                        // local → remote
                         val toRemote = launch {
                             try {
                                 val buf = ByteArray(8192)
@@ -356,10 +571,10 @@ class SshConnectionManager(private val context: Context) {
                                     remoteOut.write(buf, 0, n)
                                     remoteOut.flush()
                                 }
-                            } catch (_: Exception) {}
+                            } catch (_: Exception) {
+                            }
                         }
 
-                        // remote → local
                         val toLocal = launch {
                             try {
                                 val buf = ByteArray(8192)
@@ -369,17 +584,20 @@ class SshConnectionManager(private val context: Context) {
                                     localOut.write(buf, 0, n)
                                     localOut.flush()
                                 }
-                            } catch (_: Exception) {}
+                            } catch (_: Exception) {
+                            }
                         }
 
-                        // When either direction finishes, cancel both
                         toRemote.join()
                         toLocal.cancel()
                         channel.close()
                     } catch (e: Exception) {
                         Log.w(TAG, "Port forward connection error on $localPort", e)
                     } finally {
-                        try { localSocket.close() } catch (_: Exception) {}
+                        try {
+                            localSocket.close()
+                        } catch (_: Exception) {
+                        }
                     }
                 }
             }
@@ -388,34 +606,22 @@ class SshConnectionManager(private val context: Context) {
                 Log.e(TAG, "Port forward failed on $localPort", e)
             }
         } finally {
-            try { serverSocket?.close() } catch (_: Exception) {}
+            try {
+                serverSocket?.close()
+            } catch (_: Exception) {
+            }
         }
     }
 
-    private fun handleDisconnect(device: PiDevice) {
-        _connectionState.value = ConnectionState.Error(
-            "Connection lost. Tap to reconnect.",
-            device
-        )
-        cleanupResources()
-        stopForegroundService()
-    }
-
-    private fun getUsernameForDevice(device: PiDevice): String {
-        // Kali default user is "kali"
-        return "kali"
+    private fun getUsernameForDevice(): String {
+        return getUsername()
     }
 
     private fun startForegroundService() {
         try {
-            // Wire up the notification's "Disconnect" action to our disconnect()
             SshForegroundService.onDisconnectRequested = { disconnect() }
             val intent = Intent(context, SshForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         } catch (e: Exception) {
             Log.w(TAG, "Could not start foreground service: ${e.message}")
         }
@@ -429,15 +635,16 @@ class SshConnectionManager(private val context: Context) {
         }
     }
 
-    // ── Ed25519 Key Provider for SSHJ ───────────────────────────────────────
-
     /**
-     * Wraps our BouncyCastle-generated Ed25519 key pair into SSHJ's KeyProvider interface.
+     * Wraps our Ed25519 key pair into SSHJ's KeyProvider interface.
      */
     private class Ed25519KeyProvider(private val keyPair: KeyPair) : KeyProvider {
         override fun getPrivate(): PrivateKey = keyPair.private
+
         override fun getPublic(): PublicKey = keyPair.public
-        override fun getType(): net.schmizz.sshj.common.KeyType =
-            net.schmizz.sshj.common.KeyType.ED25519
+
+        override fun getType(): net.schmizz.sshj.common.KeyType {
+            return net.schmizz.sshj.common.KeyType.ED25519
+        }
     }
 }

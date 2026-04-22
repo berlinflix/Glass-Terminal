@@ -7,6 +7,7 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -18,9 +19,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.piterm.glassterminal.model.ConnectionState
+import com.piterm.glassterminal.model.VncServerState
 import com.piterm.glassterminal.service.SshConnectionManager
 import com.piterm.glassterminal.ui.theme.*
 
@@ -36,8 +39,11 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     val connectionState by sshManager.connectionState.collectAsState()
+    val vncServerState by sshManager.vncServerState.collectAsState()
     var publicKey by remember { mutableStateOf(sshManager.getPublicKey()) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    var vncPassword by remember { mutableStateOf(sshManager.getVncPassword()) }
+    var sshUsername by remember { mutableStateOf(sshManager.getUsername()) }
 
     Column(
         modifier = modifier
@@ -80,7 +86,54 @@ fun SettingsScreen(
                     value = device.ipAddress,
                     valueColor = ElectricCyan
                 )
-                Spacer(modifier = Modifier.height(12.dp))
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "SSH Username",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+                fontSize = 13.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = sshUsername,
+                    onValueChange = { sshUsername = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("e.g. pi or kali", color = TextMuted) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ElectricCyan,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary,
+                        cursorColor = ElectricCyan
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                FilledIconButton(
+                    onClick = {
+                        sshManager.saveUsername(sshUsername)
+                        Toast.makeText(context, "Username saved!", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = ElectricCyan,
+                        contentColor = DeepNavy
+                    )
+                ) {
+                    Icon(Icons.Default.Save, contentDescription = "Save")
+                }
+            }
+
+            if (connectionState is ConnectionState.Connected) {
+                Spacer(modifier = Modifier.height(16.dp))
                 Button(
                     onClick = {
                         sshManager.disconnect()
@@ -98,6 +151,108 @@ fun SettingsScreen(
                     Text("Disconnect")
                 }
             }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // ── Desktop on Demand ────────────────────────────────────────────
+        SettingsSection(title = "Desktop on Demand") {
+            // VNC Desktop Status
+            val (desktopStatusText, desktopStatusColor) = when (vncServerState) {
+                is VncServerState.Running -> "Desktop Active" to NeonGreen
+                is VncServerState.Starting -> "Spawning…" to AmberGlow
+                is VncServerState.Stopping -> "Killing…" to HotPink
+                is VncServerState.Error -> "Error" to HotPink
+                else -> "Stopped" to TextMuted
+            }
+
+            SettingsRow(
+                icon = Icons.Default.DesktopWindows,
+                label = "Desktop Status",
+                value = desktopStatusText,
+                valueColor = desktopStatusColor
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // VNC Password
+            Text(
+                text = "VNC Password",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+                fontSize = 13.sp
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Set the password you used with vncserver on the Pi (8 chars max).",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+                fontSize = 11.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = vncPassword,
+                    onValueChange = { if (it.length <= 8) vncPassword = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("VNC password", color = TextMuted) },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ElectricCyan,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary,
+                        cursorColor = ElectricCyan
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                FilledIconButton(
+                    onClick = {
+                        sshManager.saveVncPassword(vncPassword)
+                        Toast.makeText(context, "VNC password saved!", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = ElectricCyan,
+                        contentColor = DeepNavy
+                    )
+                ) {
+                    Icon(Icons.Default.Save, contentDescription = "Save")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Quick Reference
+            Text(
+                text = "Operations",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OperationRow(
+                emoji = "⚡",
+                title = "Attack Mode",
+                desc = "Pure CLI • ~80MB RAM"
+            )
+            OperationRow(
+                emoji = "🖥️",
+                title = "Graphical Mode",
+                desc = "Tap Spawn Desktop • ~200MB RAM"
+            )
+            OperationRow(
+                emoji = "💀",
+                title = "Kill Desktop",
+                desc = "Nuke VNC • Reclaim RAM instantly"
+            )
         }
 
         Spacer(modifier = Modifier.height(20.dp))
@@ -196,12 +351,14 @@ fun SettingsScreen(
         // ── Instructions ─────────────────────────────────────────────────
         SettingsSection(title = "Setup Guide") {
             val steps = listOf(
-                "1. Run pi_setup.sh on your Pi (as root)",
-                "2. Generate SSH keys in this app",
-                "3. Copy the public key to Pi's ~/.ssh/authorized_keys",
-                "4. Turn on your phone's Wi-Fi hotspot",
-                "5. Power on the Pi — it will auto-connect",
-                "6. Open this app — Pi will be discovered automatically"
+                "1. Flash Pi OS Lite (64-bit) with SSH + Wi-Fi",
+                "2. Run mutation script for Kali repositories",
+                "3. Install: sudo apt install -y lxde-core lxterminal tightvncserver",
+                "4. Run: vncserver :1 (set 8-char password, decline view-only)",
+                "5. Install websockify: sudo apt install -y websockify",
+                "6. Save the VNC password above in this app",
+                "7. Generate SSH keys and copy to Pi",
+                "8. Power on Pi → Connect → Spawn Desktop on demand!"
             )
             steps.forEach { step ->
                 Text(
@@ -305,5 +462,37 @@ private fun SettingsRow(
             color = valueColor,
             fontSize = 13.sp
         )
+    }
+}
+
+@Composable
+private fun OperationRow(
+    emoji: String,
+    title: String,
+    desc: String
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(emoji, fontSize = 16.sp)
+        Spacer(Modifier.width(10.dp))
+        Column {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextPrimary,
+                fontWeight = FontWeight.Medium,
+                fontSize = 13.sp
+            )
+            Text(
+                text = desc,
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+                fontSize = 11.sp
+            )
+        }
     }
 }

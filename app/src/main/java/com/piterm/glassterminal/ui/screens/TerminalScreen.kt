@@ -1,23 +1,40 @@
 package com.piterm.glassterminal.ui.screens
 
 import android.annotation.SuppressLint
+import android.net.Uri
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.webkit.WebViewAssetLoader
+import androidx.webkit.WebViewClientCompat
 import com.piterm.glassterminal.model.ConnectionState
 import com.piterm.glassterminal.service.SshConnectionManager
 import com.piterm.glassterminal.ui.components.HackerKeyboard
 import com.piterm.glassterminal.ui.theme.DeepNavy
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -62,16 +79,12 @@ fun TerminalScreen(
                     val bytesRead = inputStream.read(buffer)
                     if (bytesRead == -1) break
                     val text = String(buffer, 0, bytesRead, Charsets.UTF_8)
-                    // Escape for JavaScript string literal
-                    val escaped = text
-                        .replace("\\", "\\\\")
-                        .replace("'", "\\'")
-                        .replace("\n", "\\n")
-                        .replace("\r", "\\r")
-                        .replace("\t", "\\t")
+                    
+                    // Robust escaping for JavaScript using JSONObject.quote
+                    val quoted = JSONObject.quote(text)
 
                     withContext(Dispatchers.Main) {
-                        webView?.evaluateJavascript("writeToTerminal('$escaped')", null)
+                        webView?.evaluateJavascript("writeToTerminal($quoted)", null)
                     }
                 }
             } catch (e: Exception) {
@@ -102,7 +115,30 @@ fun TerminalScreen(
                         builtInZoomControls = false
                     }
                     setBackgroundColor(0xFF0A0E17.toInt())
-                    webViewClient = WebViewClient()
+                    
+                    val assetLoader = WebViewAssetLoader.Builder()
+                        .addPathHandler(
+                            "/assets/",
+                            WebViewAssetLoader.AssetsPathHandler(ctx)
+                        )
+                        .build()
+
+                    webViewClient = object : WebViewClientCompat() {
+                        override fun shouldInterceptRequest(
+                            view: WebView,
+                            request: WebResourceRequest
+                        ): WebResourceResponse? {
+                            return assetLoader.shouldInterceptRequest(request.url)
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun shouldInterceptRequest(
+                            view: WebView,
+                            url: String
+                        ): WebResourceResponse? {
+                            return assetLoader.shouldInterceptRequest(Uri.parse(url))
+                        }
+                    }
                     webChromeClient = WebChromeClient()
 
                     // Bridge: xterm.js → Kotlin
@@ -132,7 +168,7 @@ fun TerminalScreen(
                         }
                     }, "AndroidBridge")
 
-                    loadUrl("file:///android_asset/terminal.html")
+                    loadUrl("https://appassets.androidplatform.net/assets/terminal.html")
                     webView = this
                 }
             },
