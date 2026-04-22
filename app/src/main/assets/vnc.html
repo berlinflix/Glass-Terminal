@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+    <title>Glass VNC</title>
+    <!-- noVNC from CDN — loaded as a classic script so RFB is globally available -->
+    <script src="https://cdn.jsdelivr.net/npm/@nicely-done/novnc@1.4.0/lib/rfb.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #0A0E17;
+            touch-action: none;
+        }
+        #vnc-canvas {
+            width: 100%;
+            height: calc(100% - 28px);
+            margin-top: 28px;
+        }
+        #status-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 28px;
+            background: rgba(10, 14, 23, 0.85);
+            backdrop-filter: blur(10px);
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: #9AA0B4;
+            z-index: 1000;
+            border-bottom: 1px solid rgba(0, 229, 255, 0.15);
+        }
+        #status-bar .connected {
+            color: #00FF94;
+        }
+        #status-bar .disconnected {
+            color: #FF1744;
+        }
+        #status-bar .info {
+            margin-left: auto;
+            color: #00E5FF;
+        }
+        #password-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(10, 14, 23, 0.92);
+            backdrop-filter: blur(8px);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+        #password-overlay.visible { display: flex; }
+        #password-box {
+            background: #141926;
+            border: 1px solid rgba(0, 229, 255, 0.3);
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            min-width: 280px;
+        }
+        #password-box h3 {
+            color: #00E5FF;
+            margin-bottom: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+        }
+        #password-box input {
+            width: 100%;
+            padding: 10px 14px;
+            background: #0A0E17;
+            border: 1px solid rgba(0, 229, 255, 0.25);
+            border-radius: 8px;
+            color: #E8EAF6;
+            font-size: 14px;
+            outline: none;
+            margin-bottom: 12px;
+        }
+        #password-box input:focus {
+            border-color: #00E5FF;
+        }
+        #password-box button {
+            width: 100%;
+            padding: 10px;
+            background: #00E5FF;
+            border: none;
+            border-radius: 8px;
+            color: #0A0E17;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div id="status-bar">
+        <span id="conn-status" class="disconnected">● Connecting…</span>
+        <span class="info" id="resolution"></span>
+    </div>
+    <div id="vnc-canvas"></div>
+
+    <!-- VNC Password Overlay -->
+    <div id="password-overlay">
+        <div id="password-box">
+            <h3>🔒 VNC Password</h3>
+            <input type="password" id="vnc-pw-input" placeholder="Enter VNC password" />
+            <button id="vnc-pw-submit">Connect</button>
+        </div>
+    </div>
+
+    <script>
+        // ── noVNC Connection ─────────────────────────────────────────────
+        // noVNC connects to the websockify bridge running on the Pi,
+        // tunneled through SSH to localhost:16080
+        const WEBSOCKIFY_URL = 'ws://127.0.0.1:16080';
+
+        let rfb = null;
+        let longPressTimer = null;
+        let storedPassword = '';
+        const LONG_PRESS_MS = 500;
+
+        function connect(password) {
+            const pw = password || storedPassword || '';
+            try {
+                rfb = new RFB(document.getElementById('vnc-canvas'), WEBSOCKIFY_URL, {
+                    credentials: { password: pw },
+                    wsProtocols: ['binary'],
+                });
+
+                rfb.viewOnly = false;
+                rfb.scaleViewport = true;
+                rfb.resizeSession = false;
+                rfb.showDotCursor = true;
+                rfb.background = '#0A0E17';
+                rfb.qualityLevel = 6;
+                rfb.compressionLevel = 2;
+
+                rfb.addEventListener('connect', () => {
+                    document.getElementById('conn-status').textContent = '● Connected';
+                    document.getElementById('conn-status').className = 'connected';
+                    document.getElementById('password-overlay').classList.remove('visible');
+                    if (window.AndroidBridge) {
+                        AndroidBridge.onVncConnected();
+                    }
+                });
+
+                rfb.addEventListener('disconnect', (e) => {
+                    document.getElementById('conn-status').textContent = '● Disconnected';
+                    document.getElementById('conn-status').className = 'disconnected';
+                    if (window.AndroidBridge) {
+                        AndroidBridge.onVncDisconnected(e.detail.clean ? 'clean' : 'error');
+                    }
+                    // Auto-reconnect after 3 seconds
+                    setTimeout(() => connect(pw), 3000);
+                });
+
+                rfb.addEventListener('credentialsrequired', () => {
+                    // VNC server is demanding a password — show password dialog
+                    if (storedPassword) {
+                        rfb.sendCredentials({ password: storedPassword });
+                    } else {
+                        document.getElementById('password-overlay').classList.add('visible');
+                        document.getElementById('vnc-pw-input').focus();
+                    }
+                });
+
+                rfb.addEventListener('desktopname', (e) => {
+                    document.getElementById('resolution').textContent = e.detail.name;
+                });
+
+            } catch (e) {
+                console.error('VNC connection error:', e);
+                document.getElementById('conn-status').textContent = '● Error: ' + e.message;
+                setTimeout(() => connect(pw), 3000);
+            }
+        }
+
+        // Password submit handler
+        document.getElementById('vnc-pw-submit').addEventListener('click', () => {
+            const pw = document.getElementById('vnc-pw-input').value;
+            if (pw) {
+                storedPassword = pw;
+                document.getElementById('password-overlay').classList.remove('visible');
+                if (rfb) {
+                    rfb.sendCredentials({ password: pw });
+                } else {
+                    connect(pw);
+                }
+            }
+        });
+        document.getElementById('vnc-pw-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') document.getElementById('vnc-pw-submit').click();
+        });
+
+        // ── Touch Gesture Layer ──────────────────────────────────────────
+        const canvas = document.getElementById('vnc-canvas');
+
+        // Long press = Right click
+        canvas.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                const touch = e.touches[0];
+                longPressTimer = setTimeout(() => {
+                    if (rfb) {
+                        const rect = canvas.getBoundingClientRect();
+                        const x = touch.clientX - rect.left;
+                        const y = touch.clientY - rect.top;
+                        rfb.sendPointerEvent(x, y, 4);
+                        setTimeout(() => rfb.sendPointerEvent(x, y, 0), 50);
+                        if (navigator.vibrate) navigator.vibrate(30);
+                    }
+                }, LONG_PRESS_MS);
+            }
+        }, { passive: true });
+
+        canvas.addEventListener('touchend', () => {
+            clearTimeout(longPressTimer);
+        }, { passive: true });
+
+        canvas.addEventListener('touchmove', () => {
+            clearTimeout(longPressTimer);
+        }, { passive: true });
+
+        // ── API for Kotlin ───────────────────────────────────────────────
+        function connectVnc(password) {
+            if (password) storedPassword = password;
+            connect(password);
+        }
+
+        function setVncPassword(password) {
+            storedPassword = password;
+            if (rfb) {
+                rfb.sendCredentials({ password: password });
+            }
+        }
+
+        window.connectVnc = connectVnc;
+        window.setVncPassword = setVncPassword;
+
+        // Notify Kotlin that the VNC page is loaded
+        if (window.AndroidBridge) {
+            AndroidBridge.onVncPageReady();
+        }
+    </script>
+</body>
+</html>

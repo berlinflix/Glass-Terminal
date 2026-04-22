@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+    <title>Glass Terminal</title>
+    <!-- xterm.js from CDN (bundled for offline use in production) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"/>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #0A0E17;
+        }
+        #terminal {
+            width: 100%;
+            height: 100%;
+        }
+        /* Override xterm scrollbar for touch-friendly */
+        .xterm-viewport::-webkit-scrollbar {
+            width: 6px;
+        }
+        .xterm-viewport::-webkit-scrollbar-track {
+            background: #1A1F2E;
+        }
+        .xterm-viewport::-webkit-scrollbar-thumb {
+            background: #00E5FF44;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div id="terminal"></div>
+    <script>
+        // ── Terminal Init ────────────────────────────────────────────────
+        const term = new Terminal({
+            theme: {
+                background: '#0A0E17',
+                foreground: '#E8EAED',
+                cursor: '#00E5FF',
+                cursorAccent: '#0A0E17',
+                selectionBackground: '#00E5FF44',
+                selectionForeground: '#FFFFFF',
+                // ANSI colors — cyberpunk palette
+                black:         '#0A0E17',
+                red:           '#FF1744',
+                green:         '#00FF94',
+                yellow:        '#FFAB00',
+                blue:          '#448AFF',
+                magenta:       '#7C4DFF',
+                cyan:          '#00E5FF',
+                white:         '#E8EAED',
+                brightBlack:   '#5C6378',
+                brightRed:     '#FF5252',
+                brightGreen:   '#69F0AE',
+                brightYellow:  '#FFD740',
+                brightBlue:    '#82B1FF',
+                brightMagenta: '#B388FF',
+                brightCyan:    '#84FFFF',
+                brightWhite:   '#FFFFFF',
+            },
+            fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
+            fontSize: 14,
+            lineHeight: 1.2,
+            cursorBlink: true,
+            cursorStyle: 'bar',
+            scrollback: 5000,
+            allowProposedApi: true,
+            convertEol: true,
+            scrollOnUserInput: true,
+        });
+
+        const fitAddon = new FitAddon.FitAddon();
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+
+        term.loadAddon(fitAddon);
+        term.loadAddon(webLinksAddon);
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+
+        // ── Resize handling ──────────────────────────────────────────────
+        window.addEventListener('resize', () => {
+            fitAddon.fit();
+            // Notify Kotlin of new terminal dimensions
+            if (window.AndroidBridge) {
+                AndroidBridge.onResize(term.cols, term.rows);
+            }
+        });
+
+        // ── Data flow: Terminal → Kotlin (user input) ────────────────────
+        term.onData((data) => {
+            if (window.AndroidBridge) {
+                AndroidBridge.onTerminalInput(data);
+            }
+        });
+
+        // ── Data flow: Kotlin → Terminal (SSH output) ────────────────────
+        function writeToTerminal(data) {
+            term.write(data);
+        }
+
+        // ── Special key injection from Hacker Keyboard ──────────────────
+        function injectKey(data) {
+            // Write the escape sequence to the terminal AND send to SSH
+            if (window.AndroidBridge) {
+                AndroidBridge.onTerminalInput(data);
+            }
+        }
+
+        // ── Notify Kotlin that terminal is ready ─────────────────────────
+        function getTerminalSize() {
+            return JSON.stringify({ cols: term.cols, rows: term.rows });
+        }
+
+        // Signal ready
+        if (window.AndroidBridge) {
+            AndroidBridge.onTerminalReady(term.cols, term.rows);
+        }
+    </script>
+</body>
+</html>

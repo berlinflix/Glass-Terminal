@@ -1,0 +1,10 @@
+[
+    {
+        "merged": "com.piterm.glassterminal.app-debug-56:/xml_network_security_config.xml.flat",
+        "source": "com.piterm.glassterminal.app-main-58:/xml/network_security_config.xml"
+    },
+    {
+        "merged": "com.piterm.glassterminal.app-debug-56:/mipmap-anydpi-v26_ic_launcher.xml.flat",
+        "source": "com.piterm.glassterminal.app-main-58:/mipmap-anydpi-v26/ic_launcher.xml"
+    }
+]
